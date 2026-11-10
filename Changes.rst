@@ -1,3 +1,15 @@
+Unreleased
+==========
+
+-  Snapshot external URI resolver content for the duration of a single
+   verification. The first resolution of an external URI is captured and
+   reused for every later reference that names the same exact URI string, so
+   a resolver whose content or internal state changes mid-verification cannot
+   make two references digest different data. Each reference receives an
+   independent copy of the original (pre-transform) content, verification
+   never mutates the node returned by the resolver, resolution failures are
+   not cached, and the snapshots are released when verification finishes.
+
 Changes for v5.2.0 (2026-10-18)
 ===============================
 

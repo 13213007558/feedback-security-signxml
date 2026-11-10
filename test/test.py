@@ -19,6 +19,7 @@ import cryptography.exceptions
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import dsa, ec, rsa
+from cryptography.hazmat.primitives.hmac import HMAC
 from lxml import etree
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -1259,6 +1260,358 @@ class TestSignXML(unittest.TestCase, LoadExampleKeys):
         with self.assertRaisesRegex(InvalidInput, "Signature method RSA_SHA1 forbidden by configuration"):
             verifier.verify(signed, x509_cert=cert)
         verifier.verify(signed, x509_cert=cert, expect_config=sha1_ok_example_cert)
+
+
+class TestExternalURISnapshot(unittest.TestCase):
+    """
+    A single verification may dereference the same external URI more than once. The content returned by the resolver
+    on its first invocation must be snapshotted so every reference operates on that fixed original content.
+    """
+
+    hmac_key = b"detached-secret"
+    external_uri = "https://example.test/snapshot/data.xml"
+    ds_ns = namespaces.ds
+
+    def setUp(self):
+        self.config = SignatureConfiguration(
+            require_x509=False,
+            signature_methods=[SignatureMethod.HMAC_SHA256],
+            expect_references=True,
+        )
+        # A payload whose canonicalization differs between inclusive and exclusive transforms
+        self.payload = etree.fromstring(
+            b'<root xmlns:foo="http://example.com/foo"><!-- a comment --><child>value</child></root>'
+        )
+
+    def _build_signature(self, references):
+        """
+        Build a detached HMAC signature whose Reference elements are described by tuples of
+        (uri, payload_node, list_of_c14n_transforms), or (uri, payload_node, list_of_c14n_transforms, raw_digest).
+        Each reference's digest is computed over the payload after the given transforms, mirroring what XMLSigner
+        would produce, while allowing two references to the same URI with different transforms. An explicit
+        ``raw_digest`` overrides the computed digest (for example to digest non-XML bytes).
+        """
+        helper = XMLSignatureProcessor()
+        c14n_alg = CanonicalizationMethod.CANONICAL_XML_1_1
+        signature = etree.Element(ds_tag("Signature"), nsmap={"ds": self.ds_ns})
+        signed_info = etree.SubElement(signature, ds_tag("SignedInfo"))
+        etree.SubElement(signed_info, ds_tag("CanonicalizationMethod"), Algorithm=c14n_alg.value)
+        etree.SubElement(signed_info, ds_tag("SignatureMethod"), Algorithm=SignatureMethod.HMAC_SHA256.value)
+
+        for reference_spec in references:
+            uri, payload_node, transform_algs = reference_spec[:3]
+            reference = etree.SubElement(signed_info, ds_tag("Reference"), URI=uri)
+            if transform_algs:
+                transforms_node = etree.SubElement(reference, ds_tag("Transforms"))
+                for transform_alg in transform_algs:
+                    etree.SubElement(transforms_node, ds_tag("Transform"), Algorithm=transform_alg.value)
+            etree.SubElement(reference, ds_tag("DigestMethod"), Algorithm=DigestAlgorithm.SHA256.value)
+            digest_value = etree.SubElement(reference, ds_tag("DigestValue"))
+            if len(reference_spec) == 4:
+                digest = reference_spec[3]
+            else:
+                payload_c14n = helper._c14n(payload_node, algorithm=transform_algs[0])
+                digest = helper._get_digest(payload_c14n, DigestAlgorithm.SHA256)
+            digest_value.text = b64encode(digest).decode()
+
+        signed_info_c14n = helper._c14n(signed_info, algorithm=c14n_alg)
+        signer = HMAC(key=self.hmac_key, algorithm=hashes.SHA256())
+        signer.update(signed_info_c14n)
+        etree.SubElement(signature, ds_tag("SignatureValue")).text = b64encode(signer.finalize()).decode()
+        return signature
+
+    def _signed_info_c14n_transforms(self):
+        return (
+            CanonicalizationMethod.CANONICAL_XML_1_1,
+            CanonicalizationMethod.EXCLUSIVE_XML_CANONICALIZATION_1_0,
+        )
+
+    def test_same_uri_with_different_transforms_uses_one_snapshot(self):
+        inclusive_alg, exclusive_alg = self._signed_info_c14n_transforms()
+        helper = XMLSignatureProcessor()
+
+        class ChangingResolver:
+            def __init__(self, payload):
+                self.calls = 0
+                self.payload = payload
+
+            def __call__(self, uri):
+                self.calls += 1
+                node = etree.fromstring(etree.tostring(self.payload))
+                # Return different content on every invocation; only the first result must be trusted.
+                node.find("child").text = f"call-{self.calls}"
+                return node
+
+        # Digest what the resolver produces on its first call, so the signature is valid only if both references
+        # consume the first-call snapshot rather than the second call's different content.
+        first_call_node = etree.fromstring(etree.tostring(self.payload))
+        first_call_node.find("child").text = "call-1"
+        inclusive_c14n = helper._c14n(first_call_node, algorithm=inclusive_alg)
+        exclusive_c14n = helper._c14n(first_call_node, algorithm=exclusive_alg)
+        self.assertNotEqual(inclusive_c14n, exclusive_c14n)
+
+        signature = self._build_signature(
+            [
+                (self.external_uri, first_call_node, [inclusive_alg]),
+                (self.external_uri, first_call_node, [exclusive_alg]),
+            ]
+        )
+        resolver = ChangingResolver(self.payload)
+
+        results = XMLVerifier().verify(
+            signature, hmac_key=self.hmac_key, uri_resolver=resolver, expect_config=self.config
+        )
+
+        self.assertEqual(2, len(results))
+        self.assertEqual(resolver.calls, 1)
+        # Both references digest the same original snapshot, but apply their own transform to independent copies.
+        self.assertEqual(results[0].signed_data, inclusive_c14n)
+        self.assertEqual(results[1].signed_data, exclusive_c14n)
+        # The verified bytes are exactly the bytes that fed each digest.
+        self.assertEqual(
+            b64decode(self._find_digest(signature, 0).text),
+            XMLSignatureProcessor()._get_digest(results[0].signed_data, DigestAlgorithm.SHA256),
+        )
+        self.assertEqual(
+            b64decode(self._find_digest(signature, 1).text),
+            XMLSignatureProcessor()._get_digest(results[1].signed_data, DigestAlgorithm.SHA256),
+        )
+
+    def test_verification_does_not_mutate_resolver_node(self):
+        inclusive_alg, exclusive_alg = self._signed_info_c14n_transforms()
+        signature = self._build_signature(
+            [
+                (self.external_uri, self.payload, [inclusive_alg]),
+                (self.external_uri, self.payload, [exclusive_alg]),
+            ]
+        )
+        original_node = etree.fromstring(etree.tostring(self.payload))
+        original_serialized = etree.tostring(original_node)
+
+        class NodeResolver:
+            def __init__(self):
+                self.calls = 0
+
+            def __call__(self, uri):
+                self.calls += 1
+                # Hand back the very same node object on every call.
+                return original_node
+
+        resolver = NodeResolver()
+        XMLVerifier().verify(signature, hmac_key=self.hmac_key, uri_resolver=resolver, expect_config=self.config)
+
+        self.assertEqual(resolver.calls, 1)
+        # The node owned by the resolver must be byte-for-byte unchanged after verification.
+        self.assertEqual(original_serialized, etree.tostring(original_node))
+
+    def test_failed_digest_and_failed_resolution_are_not_cached(self):
+        inclusive_alg, exclusive_alg = self._signed_info_c14n_transforms()
+        payload = self.payload
+
+        class CountingResolver:
+            def __init__(self):
+                self.calls = 0
+
+            def __call__(self, uri):
+                self.calls += 1
+                return etree.fromstring(etree.tostring(payload))
+
+        resolver = CountingResolver()
+
+        # Corrupt the second reference's digest: verification fails on the second reference even though both
+        # references were resolved against the single first-call snapshot.
+        bad_digest = b64encode(b"not-the-right-digest")
+        bad_signature = self._build_signature(
+            [
+                (self.external_uri, self.payload, [inclusive_alg]),
+                (self.external_uri, self.payload, [exclusive_alg], bad_digest),
+            ]
+        )
+        with self.assertRaises(InvalidDigest):
+            XMLVerifier().verify(
+                bad_signature, hmac_key=self.hmac_key, uri_resolver=resolver, expect_config=self.config
+            )
+        self.assertEqual(resolver.calls, 1)
+
+        # A fresh, valid verification re-resolves because snapshots are released at the end of each verify.
+        good_signature = self._build_signature(
+            [
+                (self.external_uri, self.payload, [inclusive_alg]),
+                (self.external_uri, self.payload, [exclusive_alg]),
+            ]
+        )
+        results = XMLVerifier().verify(
+            good_signature, hmac_key=self.hmac_key, uri_resolver=resolver, expect_config=self.config
+        )
+        self.assertEqual(2, len(results))
+        self.assertEqual(resolver.calls, 2)
+
+        # A resolver that raises or returns None is never remembered as a successful resolution.
+        class FailingResolver:
+            def __init__(self, fail_with):
+                self.calls = 0
+                self.fail_with = fail_with
+
+            def __call__(self, uri):
+                self.calls += 1
+                if self.calls == 1:
+                    raise self.fail_with
+                return etree.fromstring(etree.tostring(payload))
+
+        raising_resolver = FailingResolver(RuntimeError("transient resolution failure"))
+        with self.assertRaisesRegex(RuntimeError, "transient resolution failure"):
+            XMLVerifier().verify(
+                good_signature, hmac_key=self.hmac_key, uri_resolver=raising_resolver, expect_config=self.config
+            )
+        self.assertEqual(raising_resolver.calls, 1)
+        # The failure left nothing behind, so the next verification's successful call is used.
+        XMLVerifier().verify(
+            good_signature, hmac_key=self.hmac_key, uri_resolver=raising_resolver, expect_config=self.config
+        )
+        self.assertEqual(raising_resolver.calls, 2)
+
+        none_resolver = FailingResolver(ValueError("unused"))
+        none_resolver.fail_with = None
+
+        def return_none_first(uri):
+            none_resolver.calls += 1
+            if none_resolver.calls == 1:
+                return None
+            return etree.fromstring(etree.tostring(payload))
+
+        with self.assertRaisesRegex(InvalidInput, "Unable to resolve reference URI"):
+            XMLVerifier().verify(
+                good_signature, hmac_key=self.hmac_key, uri_resolver=return_none_first, expect_config=self.config
+            )
+        XMLVerifier().verify(
+            good_signature, hmac_key=self.hmac_key, uri_resolver=return_none_first, expect_config=self.config
+        )
+        self.assertEqual(none_resolver.calls, 2)
+
+    def test_distinct_uris_are_never_merged(self):
+        inclusive_alg, exclusive_alg = self._signed_info_c14n_transforms()
+        second_uri = "https://example.test/snapshot/data.xml/"  # trailing slash makes it a different identifier
+        signature = self._build_signature(
+            [
+                (self.external_uri, self.payload, [inclusive_alg]),
+                (second_uri, self.payload, [exclusive_alg]),
+            ]
+        )
+
+        seen_uris = []
+
+        def resolver(uri):
+            seen_uris.append(uri)
+            node = etree.fromstring(etree.tostring(self.payload))
+            return node
+
+        results = XMLVerifier().verify(
+            signature, hmac_key=self.hmac_key, uri_resolver=resolver, expect_config=self.config
+        )
+        self.assertEqual(2, len(results))
+        self.assertEqual(seen_uris, [self.external_uri, second_uri])
+
+    def test_snapshot_is_released_between_independent_verifications(self):
+        inclusive_alg, _ = self._signed_info_c14n_transforms()
+        helper = XMLSignatureProcessor()
+        single_ref_config = replace(self.config, expect_references=1)
+
+        class RotatingResolver:
+            def __init__(self, payload):
+                self.calls = 0
+                self.payload = payload
+
+            def __call__(self, uri):
+                self.calls += 1
+                node = etree.fromstring(etree.tostring(self.payload))
+                node.find("child").text = f"rotation-{self.calls}"
+                return node
+
+        resolver = RotatingResolver(self.payload)
+        verifier = XMLVerifier()
+
+        # Sign the content produced on the first resolution of each independent verification.
+        first_node = etree.fromstring(etree.tostring(self.payload))
+        first_node.find("child").text = "rotation-1"
+        signature = self._build_signature([(self.external_uri, first_node, [inclusive_alg])])
+
+        first = verifier.verify(
+            signature, hmac_key=self.hmac_key, uri_resolver=resolver, expect_config=single_ref_config
+        )
+        # The second verification starts from a fresh snapshot, so its first resolution is "rotation-2". Rebuild the
+        # signature over that content to show each verify is pinned to its own first call.
+        second_node = etree.fromstring(etree.tostring(self.payload))
+        second_node.find("child").text = "rotation-2"
+        second_signature = self._build_signature([(self.external_uri, second_node, [inclusive_alg])])
+        second = verifier.verify(
+            second_signature, hmac_key=self.hmac_key, uri_resolver=resolver, expect_config=single_ref_config
+        )
+
+        # Each independent verify re-resolves because the previous snapshot was released.
+        self.assertEqual(resolver.calls, 2)
+        self.assertEqual(first.signed_data, helper._c14n(first_node, algorithm=inclusive_alg))
+        self.assertEqual(second.signed_data, helper._c14n(second_node, algorithm=inclusive_alg))
+        self.assertIn(b"rotation-1", first.signed_data)
+        self.assertIn(b"rotation-2", second.signed_data)
+
+    def test_bytes_resolver_output_is_pinned_and_traceable(self):
+        helper = XMLSignatureProcessor()
+        raw_bytes = b"binary payload that is not XML"
+        # The resolver's first call appends "-1"; that is the content that gets snapshotted and digested. Bytes
+        # payloads carry no c14n transform at verification time, so the raw bytes are digested directly.
+        first_call_bytes = raw_bytes + b"-1"
+        raw_digest = helper._get_digest(first_call_bytes, DigestAlgorithm.SHA256)
+        signature = self._build_signature([(self.external_uri, self.payload, [], raw_digest)])
+
+        class BytesResolver:
+            def __init__(self):
+                self.calls = 0
+
+            def __call__(self, uri):
+                self.calls += 1
+                return raw_bytes + f"-{self.calls}".encode()
+
+        resolver = BytesResolver()
+        single_ref_config = replace(self.config, expect_references=1)
+        result = XMLVerifier().verify(
+            signature, hmac_key=self.hmac_key, uri_resolver=resolver, expect_config=single_ref_config
+        )
+        self.assertEqual(resolver.calls, 1)
+        self.assertEqual(result.signed_data, raw_bytes + b"-1")
+        # The returned verified content is exactly what the digest was computed over.
+        self.assertEqual(b64decode(self._find_digest(signature, 0).text), helper._get_digest(result.signed_data, DigestAlgorithm.SHA256))
+
+    def test_snapshot_store_direct_contract(self):
+        helper = XMLSignatureProcessor()
+        store = processor._ExternalURISnapshot(helper)
+        node = etree.fromstring(b"<root><child>original</child></root>")
+
+        def resolver(uri):
+            if uri == "fail":
+                return None
+            return etree.fromstring(etree.tostring(node))
+
+        first = store.resolve("u", resolver)
+        first.find("child").text = "mutated"
+        second = store.resolve("u", resolver)
+        # Each retrieval is an independent copy of the untouched original snapshot.
+        self.assertEqual(second.find("child").text, "original")
+        self.assertEqual(node.find("child").text, "original")
+
+        with self.assertRaises(InvalidInput):
+            store.resolve("fail", resolver)
+        self.assertNotIn("fail", store._snapshots)
+
+        with self.assertRaises(InvalidInput):
+            store.resolve("bad", lambda uri: object())
+
+        store.release()
+        self.assertEqual(store._snapshots, {})
+
+    @staticmethod
+    def _find_digest(signature, index):
+        references = signature.findall("ds:SignedInfo/ds:Reference", namespaces=namespaces)
+        return references[index].find("ds:DigestValue", namespaces=namespaces)
 
 
 class TestXAdES(unittest.TestCase, LoadExampleKeys):

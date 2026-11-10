@@ -22,7 +22,7 @@ from .algorithms import (
     digest_algorithm_implementations,
 )
 from .exceptions import InvalidCertificate, InvalidDigest, InvalidInput, InvalidSignature, SignXMLException
-from .processor import XMLSignatureProcessor
+from .processor import XMLSignatureProcessor, _ExternalURISnapshot
 from .util import (
     X509CertChainVerifier,
     _remove_sig,
@@ -446,7 +446,17 @@ class XMLVerifier(XMLSignatureProcessor):
             Function to use to resolve reference URIs that are not empty and don't start with "#" (such references are
             only expected in detached signatures; if you don't expect such signatures, leave this unset to prevent them
             from validating). The function is called with a single string argument containing the URI to be resolved,
-            and is expected to return a :class:`lxml.etree._Element` node or bytes.
+            and is expected to return a :class:`lxml.etree._Element` node or bytes. SignXML does not perform any
+            network access itself; this callback is responsible for retrieving the content.
+
+            During a single ``verify()`` call, the value returned for a given URI is snapshotted on its first
+            resolution and reused for every later reference that names that exact same URI string. This pins each
+            external reference to the content the resolver produced the first time it was asked, even if the remote
+            resource or the resolver's internal state changes mid-verification. The snapshot stores the resolver's
+            raw output (before any transforms); each reference receives an independent copy, so verification never
+            mutates the node returned by the resolver. URIs are compared by exact string equality without any
+            normalization, and a resolution failure is never cached. The snapshots are released as soon as the
+            verification finishes.
         :param id_attribute:
             Name of the attribute whose value ``URI`` refers to. By default, SignXML will search for "Id", then "ID".
         :param expect_config:
@@ -614,10 +624,18 @@ class XMLVerifier(XMLSignatureProcessor):
 
         verified_signed_info = self._fromstring(verified_signed_info_c14n)
         verify_results: list[VerifyResult] = []
-        for idx, reference in enumerate(self._findall(verified_signed_info, "Reference")):
-            verify_results.append(
-                self._verify_reference(reference, idx, root, uri_resolver, c14n_algorithm, signature, key_used)
-            )
+        # Snapshot external URI content for the duration of this verification so repeated references to the same URI
+        # always operate on the bytes or node returned by the resolver on its first invocation.
+        uri_snapshots = _ExternalURISnapshot(self)
+        try:
+            for idx, reference in enumerate(self._findall(verified_signed_info, "Reference")):
+                verify_results.append(
+                    self._verify_reference(
+                        reference, idx, root, uri_resolver, c14n_algorithm, signature, key_used, uri_snapshots
+                    )
+                )
+        finally:
+            uri_snapshots.release()
 
         if type(self.config.expect_references) is int and len(verify_results) != self.config.expect_references:
             msg = "Expected to find {} references, but found {}"
@@ -638,13 +656,16 @@ class XMLVerifier(XMLSignatureProcessor):
         c14n_algorithm,
         signature,
         signature_key_used,
+        uri_snapshots,
     ):
         copied_root = self._fromstring(self._tostring(root))
         copied_signature_ref = self._get_signature(copied_root)
         transforms = self._find(reference, "Transforms", require=False)
         digest_method_alg_name = self._find(reference, "DigestMethod").get("Algorithm")
         digest_value = self._find(reference, "DigestValue")
-        payload = self._resolve_reference(copied_root, reference, uri_resolver=uri_resolver)
+        payload = self._resolve_reference(
+            copied_root, reference, uri_resolver=uri_resolver, uri_snapshots=uri_snapshots
+        )
         payload_c14n = self._apply_transforms(
             payload,
             transforms_node=transforms,

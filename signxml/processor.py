@@ -73,6 +73,55 @@ class XMLProcessor:
             return self._fromstring(self._tostring(data))
 
 
+class _ExternalURISnapshot:
+    """
+    Per-verification snapshot of the data returned by the external URI resolver.
+
+    The first time a given external URI is resolved during a single verification, the resolver's raw output (before
+    any transform or canonicalization) is captured here. Every later request for the same URI is served from this
+    snapshot, so a resolver that returns different content on each call (or whose internal state changes) cannot make
+    two references that name the same URI digest different data.
+
+    URIs are matched by exact string equality only; no normalization is applied, so identifiers that merely look
+    equivalent (for example, differing only in case or a trailing slash) are never merged. Resolver failures are not
+    stored, so a failed lookup is retried on the next request. The snapshot is discarded at the end of the
+    verification that created it via :meth:`release`.
+    """
+
+    def __init__(self, processor: XMLSignatureProcessor):
+        self._processor = processor
+        self._snapshots: dict[str, bytes | etree._Element] = {}
+
+    def resolve(self, uri: str, uri_resolver):
+        if uri in self._snapshots:
+            return self._copy(self._snapshots[uri])
+        result = uri_resolver(uri)
+        if result is None:
+            raise InvalidInput(f"Unable to resolve reference URI: {uri}")
+        if isinstance(result, bytes):
+            # bytes are immutable, so the snapshot can be returned directly without an additional copy
+            self._snapshots[uri] = result
+            return result
+        if etree.iselement(result):
+            # Snapshot the raw node through a serialization roundtrip so the caller can never mutate the node held by
+            # the resolver, and later references receive their own independent copy of the original content.
+            snapshot = self._processor._fromstring(self._processor._tostring(result))
+            self._snapshots[uri] = snapshot
+            return self._copy(snapshot)
+        raise InvalidInput(
+            f"URI resolver returned an unsupported object of type {type(result).__name__}; expected bytes or an "
+            f"lxml.etree element"
+        )
+
+    def _copy(self, snapshot: bytes | etree._Element):
+        if isinstance(snapshot, bytes):
+            return snapshot
+        return self._processor._fromstring(self._processor._tostring(snapshot))
+
+    def release(self) -> None:
+        self._snapshots.clear()
+
+
 class XMLSignatureProcessor(XMLProcessor):
     schema_files: ClassVar[list[str]] = ["xmldsig1-schema.xsd"]
 
@@ -152,7 +201,7 @@ class XMLSignatureProcessor(XMLProcessor):
         logger.debug("Canonicalized string (exclusive=%s, with_comments=%s): %s", exclusive, with_comments, c14n)
         return c14n
 
-    def _resolve_reference(self, doc_root, reference, uri_resolver=None):
+    def _resolve_reference(self, doc_root, reference, uri_resolver=None, uri_snapshots: _ExternalURISnapshot | None = None):
         uri = reference.get("URI")
         if uri is None:
             raise InvalidInput("References without URIs are not supported")
@@ -173,7 +222,10 @@ class XMLSignatureProcessor(XMLProcessor):
         else:
             if uri_resolver is None:
                 raise InvalidInput(f"External URI dereferencing is not configured: {uri}")
-            result = uri_resolver(uri)
-            if result is None:
-                raise InvalidInput(f"Unable to resolve reference URI: {uri}")
-            return result
+            if uri_snapshots is None:
+                # No verification-scoped snapshot (e.g. when called from the signer): dereference directly.
+                result = uri_resolver(uri)
+                if result is None:
+                    raise InvalidInput(f"Unable to resolve reference URI: {uri}")
+                return result
+            return uri_snapshots.resolve(uri, uri_resolver)
