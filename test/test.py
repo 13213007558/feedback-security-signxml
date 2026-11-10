@@ -213,6 +213,138 @@ class TestVerifyXML(unittest.TestCase, LoadExampleKeys):
         self.assertTrue(all(result is results[0] for result in results))
 
 
+class TestIdAttributeResolution(unittest.TestCase):
+    hmac_key = b"secret"
+    hmac_config = SignatureConfiguration(require_x509=False, signature_methods=[SignatureMethod.HMAC_SHA256])
+
+    def setUp(self):
+        self.signer = XMLSigner(
+            method=methods.enveloped,
+            signature_algorithm=SignatureMethod.HMAC_SHA256,
+            digest_algorithm=DigestAlgorithm.SHA256,
+        )
+
+    def sign_payload(self, root, **sign_kwargs):
+        return etree.tostring(self.signer.sign(root, key=self.hmac_key, **sign_kwargs))
+
+    def verify(self, signed_data, **verify_kwargs):
+        expect_config = verify_kwargs.pop("expect_config", self.hmac_config)
+        return XMLVerifier().verify(signed_data, hmac_key=self.hmac_key, expect_config=expect_config, **verify_kwargs)
+
+    def test_single_reference_returns_exact_signed_node(self):
+        root = etree.fromstring(b'<root><payload Id="x"><data>signed</data></payload></root>')
+        signed_data = self.sign_payload(root, reference_uri="#x")
+
+        res = self.verify(signed_data)
+
+        self.assertIsInstance(res, VerifyResult)
+        self.assertEqual(res.signed_xml.tag, "payload")
+        self.assertEqual(res.signed_xml.get("Id"), "x")
+        self.assertEqual(res.signed_xml.find("data").text, "signed")
+        self.assertIsNone(res.signed_xml.find(".//{http://www.w3.org/2000/09/xmldsig#}Signature"))
+        self.assertEqual(res.signature_xml.tag, "{http://www.w3.org/2000/09/xmldsig#}Signature")
+
+    def test_multiple_references_return_exact_signed_nodes(self):
+        root = etree.fromstring(
+            b'<root><payload Id="a"><data>one</data></payload><payload Id="b"><data>two</data></payload></root>'
+        )
+        signed_data = self.sign_payload(root, reference_uri=["#a", "#b"])
+
+        results = self.verify(signed_data, expect_config=replace(self.hmac_config, expect_references=2))
+
+        self.assertEqual(2, len(results))
+        self.assertEqual([r.signed_xml.get("Id") for r in results], ["a", "b"])
+        self.assertEqual([r.signed_xml.find("data").text for r in results], ["one", "two"])
+        for res in results:
+            self.assertEqual(res.signature_xml.tag, "{http://www.w3.org/2000/09/xmldsig#}Signature")
+
+    def test_duplicate_id_value_on_different_attribute_names_is_ambiguous(self):
+        for attacker_attribute in ("ID", "id", "{http://www.w3.org/XML/1998/namespace}id"):
+            root = etree.fromstring(b'<root><payload Id="x"><data>signed</data></payload></root>')
+            signed_data = self.sign_payload(root, reference_uri="#x")
+
+            signed_root = etree.fromstring(signed_data)
+            attacker = etree.SubElement(signed_root, "attacker")
+            attacker.set(attacker_attribute, "x")
+
+            with self.assertRaisesRegex(InvalidInput, "Ambiguous reference URI"):
+                self.verify(etree.tostring(signed_root))
+
+    def test_duplicate_id_value_on_same_node_is_not_ambiguous(self):
+        root = etree.fromstring(b'<root><payload Id="x" ID="x"><data>signed</data></payload></root>')
+        signed_data = self.sign_payload(root, reference_uri="#x")
+
+        res = self.verify(signed_data)
+
+        self.assertEqual(res.signed_xml.tag, "payload")
+        self.assertEqual(res.signed_xml.get("Id"), "x")
+
+    def test_default_id_attributes_include_xml_id(self):
+        root = etree.fromstring(b'<root><payload xml:id="x"><data>signed</data></payload></root>')
+        signed_data = self.sign_payload(root, reference_uri="#x")
+
+        res = self.verify(signed_data)
+
+        self.assertEqual(res.signed_xml.tag, "payload")
+        self.assertEqual(res.signed_xml.get("{http://www.w3.org/XML/1998/namespace}id"), "x")
+
+    def test_explicit_id_attribute_does_not_match_namespaced_attribute(self):
+        root = etree.fromstring(b'<root xmlns:foo="urn:foo"><payload foo:Id="x"><data>signed</data></payload></root>')
+        with self.assertRaisesRegex(InvalidInput, "Unable to resolve reference URI"):
+            self.sign_payload(root, reference_uri="#x", id_attribute="Id")
+
+    def test_explicit_id_attribute_with_namespace_prefix(self):
+        root = etree.fromstring(b'<root><payload xml:id="x"><data>signed</data></payload></root>')
+        signed_data = self.sign_payload(root, reference_uri="#x", id_attribute="xml:id")
+
+        res = self.verify(signed_data, id_attribute="xml:id")
+
+        self.assertEqual(res.signed_xml.tag, "payload")
+
+    def test_explicit_id_attribute_with_unknown_namespace_prefix(self):
+        root = etree.fromstring(b'<root><payload Id="x"/></root>')
+        with self.assertRaisesRegex(InvalidInput, "Unknown namespace prefix"):
+            self.sign_payload(root, reference_uri="#x", id_attribute="foo:id")
+
+    def test_id_attribute_setting_does_not_leak_between_verifications(self):
+        custom_root = etree.fromstring(b'<root><payload X="x"/></root>')
+        custom_signed_data = self.sign_payload(custom_root, reference_uri="#x", id_attribute="X")
+        default_root = etree.fromstring(b'<root><payload Id="y"><data>signed</data></payload></root>')
+        default_signed_data = self.sign_payload(default_root, reference_uri="#y")
+
+        verifier = XMLVerifier()
+        res = verifier.verify(
+            custom_signed_data, hmac_key=self.hmac_key, expect_config=self.hmac_config, id_attribute="X"
+        )
+        self.assertEqual(res.signed_xml.get("X"), "x")
+
+        # The explicit id_attribute from the previous call must not be retained
+        res = verifier.verify(default_signed_data, hmac_key=self.hmac_key, expect_config=self.hmac_config)
+        self.assertEqual(res.signed_xml.get("Id"), "y")
+
+        with self.assertRaisesRegex(InvalidInput, "Unable to resolve reference URI"):
+            verifier.verify(custom_signed_data, hmac_key=self.hmac_key, expect_config=self.hmac_config)
+
+    def test_id_attribute_setting_does_not_leak_between_signatures(self):
+        custom_root = etree.fromstring(b'<root><payload X="x"/></root>')
+        self.signer.sign(custom_root, key=self.hmac_key, reference_uri="#x", id_attribute="X")
+
+        default_root = etree.fromstring(b'<root><payload Id="y"><data>signed</data></payload></root>')
+        signed = self.signer.sign(default_root, key=self.hmac_key, reference_uri="#y")
+        res = self.verify(etree.tostring(signed))
+        self.assertEqual(res.signed_xml.get("Id"), "y")
+
+    def test_signed_xml_consumption_example(self):
+        root = etree.fromstring(b'<root><assertion Id="assertion-1"><subject>alice</subject></assertion></root>')
+        signed_data = self.sign_payload(root, reference_uri="#assertion-1")
+
+        # Consume only the signed_xml returned by verify(); never trust the input document
+        verified_assertion = self.verify(signed_data).signed_xml
+
+        self.assertEqual(verified_assertion.tag, "assertion")
+        self.assertEqual(verified_assertion.find("subject").text, "alice")
+
+
 class TestSignXML(unittest.TestCase, LoadExampleKeys):
     def setUp(self):
         self.example_xml_files = (
@@ -1099,13 +1231,27 @@ class TestSignXML(unittest.TestCase, LoadExampleKeys):
         with open(os.path.join(wsse_dir, "examples", "server_public.pem"), "rb") as fh:
             crt = fh.read()
         data = etree.parse(os.path.join(wsse_dir, "test", "unit", "client", "files", "valid wss resp.xml"))
-        XMLVerifier().verify(data, x509_cert=crt, validate_schema=False, expect_references=2, expect_config=sha1_ok)
+        XMLVerifier().verify(
+            data,
+            x509_cert=crt,
+            validate_schema=False,
+            expect_references=2,
+            expect_config=sha1_ok,
+            id_attribute="wsu:Id",
+        )
 
         data = etree.parse(
             os.path.join(wsse_dir, "test", "unit", "client", "files", "invalid wss resp - changed content.xml")
         )
         with self.assertRaisesRegex(InvalidDigest, "Digest mismatch for reference 0"):
-            XMLVerifier().verify(data, x509_cert=crt, validate_schema=False, expect_references=2, expect_config=sha1_ok)
+            XMLVerifier().verify(
+                data,
+                x509_cert=crt,
+                validate_schema=False,
+                expect_references=2,
+                expect_config=sha1_ok,
+                id_attribute="wsu:Id",
+            )
 
     def test_psha1(self):
         from signxml.util import p_sha1

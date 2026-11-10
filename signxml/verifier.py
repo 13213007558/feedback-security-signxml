@@ -448,7 +448,9 @@ class XMLVerifier(XMLSignatureProcessor):
             from validating). The function is called with a single string argument containing the URI to be resolved,
             and is expected to return a :class:`lxml.etree._Element` node or bytes.
         :param id_attribute:
-            Name of the attribute whose value ``URI`` refers to. By default, SignXML will search for "Id", then "ID".
+            Name of the attribute whose value ``URI`` refers to. By default, SignXML will consider "Id", "ID",
+            "id", and "xml:id". This setting applies only to the current call; it is not retained for subsequent
+            verifications performed by the same verifier instance.
         :param expect_config:
             Expected signature configuration. Pass a :class:`SignatureConfiguration` object to describe expected
             properties of the verified signature. Signatures with unexpected configurations will fail validation.
@@ -491,6 +493,9 @@ class XMLVerifier(XMLSignatureProcessor):
 
         if id_attribute is not None:
             self.id_attributes = (id_attribute,)
+        elif "id_attributes" in self.__dict__:
+            # Reset any per-operation override left over from a previous call
+            del self.id_attributes
 
         root = self.get_root(data)
         signature_ref = self._get_signature(root)

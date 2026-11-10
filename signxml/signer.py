@@ -185,7 +185,9 @@ class XMLSigner(XMLSignatureProcessor):
             or other custom key references. An example value can be found here:
             https://github.com/XML-Security/signxml/blob/master/test/wsse_keyinfo.xml
         :param id_attribute:
-            Name of the attribute whose value ``URI`` refers to. By default, SignXML will search for "Id", then "ID".
+            Name of the attribute whose value ``URI`` refers to. By default, SignXML will consider "Id", "ID",
+            "id", and "xml:id". This setting applies only to the current call; it is not retained for subsequent
+            signing operations performed by the same signer instance.
         :param always_add_key_value:
             Write the key value to the KeyInfo element even if a X509 certificate is present. Use of this parameter
             is discouraged, as it introduces an ambiguity and a security hazard. The public key used to sign the
@@ -219,6 +221,9 @@ class XMLSigner(XMLSignatureProcessor):
         """
         if id_attribute is not None:
             self.id_attributes = (id_attribute,)
+        elif "id_attributes" in self.__dict__:
+            # Reset any per-operation override left over from a previous call
+            del self.id_attributes
 
         cert_chain = self._get_cert_chain(cert)
 

@@ -100,6 +100,11 @@ class XMLSignatureProcessor(XMLProcessor):
 
     id_attributes: tuple[str, ...] = ("Id", "ID", "id", "xml:id")
 
+    _known_id_attribute_namespaces: ClassVar[dict[str, str]] = {
+        "xml": "http://www.w3.org/XML/1998/namespace",
+        "wsu": "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd",
+    }
+
     def _get_digest(self, data, algorithm: DigestAlgorithm):
         algorithm_implementation = digest_algorithm_implementations[algorithm]()
         hasher = Hash(algorithm=algorithm_implementation)
@@ -162,13 +167,11 @@ class XMLSignatureProcessor(XMLProcessor):
             raise InvalidInput("XPointer references are not supported")
             # doc_root.xpath(uri.lstrip("#"))[0]
         elif uri.startswith("#"):
-            for id_attribute in self.id_attributes:
-                xpath_query = f"//*[@*[local-name() = '{id_attribute}']=$uri]"
-                results = doc_root.xpath(xpath_query, uri=uri.lstrip("#"))
-                if len(results) > 1:
-                    raise InvalidInput(f"Ambiguous reference URI {uri} resolved to {len(results)} nodes")
-                elif len(results) == 1:
-                    return results[0]
+            results = self._find_referenced_nodes(doc_root, uri.lstrip("#"))
+            if len(results) > 1:
+                raise InvalidInput(f"Ambiguous reference URI {uri} resolved to {len(results)} nodes")
+            elif len(results) == 1:
+                return results[0]
             raise InvalidInput(f"Unable to resolve reference URI: {uri}")
         else:
             if uri_resolver is None:
@@ -177,3 +180,24 @@ class XMLSignatureProcessor(XMLProcessor):
             if result is None:
                 raise InvalidInput(f"Unable to resolve reference URI: {uri}")
             return result
+
+    def _find_referenced_nodes(self, doc_root, uri):
+        # Match all configured ID attributes in a single query so that a value collision across
+        # different ID attribute names (e.g. Id on one node, ID on another) is detected as
+        # ambiguous regardless of search order. Each attribute name is matched exactly: an
+        # unprefixed name matches only a no-namespace attribute of that name, and a prefixed
+        # name (e.g. "xml:id") matches only an attribute in that prefix's namespace. Because a
+        # single XPath query returns each node at most once, multiple equivalent ID attributes
+        # on the same node are not treated as ambiguous.
+        predicates = []
+        for id_attribute in self.id_attributes:
+            prefix, sep, local_name = id_attribute.partition(":")
+            if sep:
+                namespace = self._known_id_attribute_namespaces.get(prefix, namespaces.get(prefix))
+                if namespace is None:
+                    raise InvalidInput(f"Unknown namespace prefix in id_attribute: {id_attribute}")
+                predicates.append(f"@*[local-name() = '{local_name}' and namespace-uri() = '{namespace}'] = $uri")
+            else:
+                predicates.append(f"@{id_attribute} = $uri")
+        xpath_query = "//*[" + " or ".join(predicates) + "]"
+        return doc_root.xpath(xpath_query, uri=uri)
