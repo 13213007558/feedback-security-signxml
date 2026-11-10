@@ -19,6 +19,7 @@ from .algorithms import (
     DigestAlgorithm,
     SignatureConstructionMethod,
     SignatureMethod,
+    TransformAlgorithm,
     digest_algorithm_implementations,
 )
 from .exceptions import InvalidCertificate, InvalidDigest, InvalidInput, InvalidSignature, SignXMLException
@@ -103,6 +104,27 @@ class SignatureConfiguration:
     setting; SignedInfo should include every transformation that were applied to the reference before creating
     the digests and signature, but there are some uses of XML Signatures where the canonicalization method is
     fixed, and not added to the Transforms. This setting can be used to validate signatures in those use-cases.
+    """
+
+    strict_transform_policy: bool = False
+    """
+    When ``False`` (the default, compatibility mode), the transform chain is processed leniently: unrecognized
+    transform algorithms are skipped, and transform order is not enforced.
+
+    When ``True``, every reference's ``Transforms`` chain is validated in declaration order before it is applied.
+    A transform is rejected with :class:`signxml.exceptions.InvalidInput` if any of the following applies:
+
+    * the transform algorithm is not recognized (this includes XPath, XSLT and other transforms that SignXML does
+      not implement — they are never silently ignored);
+    * the transform is incompatible with the output type of the preceding transforms (a node-set is required before
+      an enveloped-signature or canonicalization transform; a text node is required before a base64 transform);
+    * the same transform family (enveloped-signature, base64, or canonicalization) appears more than once;
+    * the transforms are not arranged in a meaningful order: enveloped-signature may only be the first transform,
+      and base64 or canonicalization (the transforms that produce bytes) may only be the last transform.
+
+    The set of allowed algorithms is not configurable: the supported algorithms are enveloped-signature, base64,
+    and the canonicalization methods enumerated by :class:`CanonicalizationMethod`. Allowing an algorithm does not
+    make every ordering of a chain containing it valid.
     """
 
 
@@ -233,17 +255,27 @@ class XMLVerifier(XMLSignatureProcessor):
         *,
         transforms_node: etree._Element,
         signature: etree._Element,
+        reference_index: int,
+        reference_uri: str | None,
     ):
-        transforms, c14n_applied = [], False
+        transforms = []
         if transforms_node is not None:
             transforms = self._findall(transforms_node, "Transform")
 
+        if self.config.strict_transform_policy:
+            self._validate_transform_chain(
+                transforms, initial_payload=payload, reference_index=reference_index, reference_uri=reference_uri
+            )
+            return self._apply_transform_chain(payload, transforms, signature=signature)
+
+        # Compatibility mode: unknown transforms are ignored, and transform order is not enforced.
+        c14n_applied = False
         for transform in transforms:
             if transform.get("Algorithm") == SignatureConstructionMethod.enveloped.value:
                 _remove_sig(signature, idempotent=True)
 
         for transform in transforms:
-            if transform.get("Algorithm") == "http://www.w3.org/2000/09/xmldsig#base64":
+            if transform.get("Algorithm") == TransformAlgorithm.BASE64.value:
                 payload = b64decode(payload.text)
 
         for transform in transforms:
@@ -263,6 +295,97 @@ class XMLVerifier(XMLSignatureProcessor):
                 payload, algorithm=c14n_algorithm_from_transform, inclusive_ns_prefixes=inclusive_ns_prefixes
             )
             c14n_applied = True
+
+        if not c14n_applied and not isinstance(payload, (str, bytes)):
+            # Create a separate copy of the node, see above
+            payload = self._fromstring(self._tostring(payload))
+            payload = self._c14n(payload, algorithm=self.config.default_reference_c14n_method)
+        return payload
+
+    def _identify_transform(self, algorithm: str) -> TransformAlgorithm | CanonicalizationMethod | None:
+        if algorithm == TransformAlgorithm.ENVELOPED_SIGNATURE.value:
+            return TransformAlgorithm.ENVELOPED_SIGNATURE
+        if algorithm == TransformAlgorithm.BASE64.value:
+            return TransformAlgorithm.BASE64
+        try:
+            return CanonicalizationMethod(algorithm)
+        except ValueError:
+            return None
+
+    def _validate_transform_chain(self, transforms, *, initial_payload, reference_index, reference_uri):
+        reference_location = f"reference {reference_index} (URI={reference_uri!r})"
+
+        def policy_error(position, algorithm, reason):
+            raise InvalidInput(
+                f"Strict transform policy violation in {reference_location}, transform at position {position} "
+                f"(algorithm={algorithm!r}): {reason}"
+            )
+
+        seen_families: set[str] = set()
+        payload_is_bytes = isinstance(initial_payload, (str, bytes))
+        chain_length = len(transforms)
+
+        for position, transform in enumerate(transforms):
+            algorithm = transform.get("Algorithm")
+            identity = self._identify_transform(algorithm)
+            if identity is None:
+                policy_error(position, algorithm, "unrecognized or unsupported transform algorithm")
+
+            if isinstance(identity, CanonicalizationMethod):
+                family = "canonicalization"
+            else:
+                family = identity.name.lower()
+            if family in seen_families:
+                policy_error(position, algorithm, f"duplicate {family} transform")
+            seen_families.add(family)
+
+            if payload_is_bytes:
+                policy_error(
+                    position,
+                    algorithm,
+                    "transform requires a node-set input, but the preceding transforms already produced bytes",
+                )
+
+            if identity is TransformAlgorithm.ENVELOPED_SIGNATURE and position != 0:
+                policy_error(position, algorithm, "enveloped-signature transform may only be the first transform")
+            if identity is TransformAlgorithm.BASE64:
+                if position != chain_length - 1:
+                    policy_error(position, algorithm, "base64 transform may only be the last transform")
+                # A base64 transform can only land here as the first and last transform, so the initial payload is
+                # still the referenced node and must carry decodable text.
+                if not etree.iselement(initial_payload) or initial_payload.text is None:
+                    policy_error(
+                        position, algorithm, "base64 transform requires an element node with text content as input"
+                    )
+            if isinstance(identity, CanonicalizationMethod) and position != chain_length - 1:
+                policy_error(position, algorithm, "canonicalization transform may only be the last transform")
+
+            if identity is TransformAlgorithm.BASE64 or isinstance(identity, CanonicalizationMethod):
+                # Both transforms terminate the chain by converting the node-set to bytes.
+                payload_is_bytes = True
+
+    def _apply_transform_chain(self, payload, transforms, *, signature):
+        c14n_applied = False
+        for transform in transforms:
+            algorithm = transform.get("Algorithm")
+            identity = self._identify_transform(algorithm)
+            if identity is TransformAlgorithm.ENVELOPED_SIGNATURE:
+                _remove_sig(signature, idempotent=True)
+            elif identity is TransformAlgorithm.BASE64:
+                payload = b64decode(payload.text)
+            else:
+                assert isinstance(identity, CanonicalizationMethod)
+                inclusive_ns_prefixes = self._get_inclusive_ns_prefixes(transform)
+
+                # Create a separate copy of the node so we can modify the tree and avoid any c14n inconsistencies from
+                # namespaces propagating from parent nodes. The lxml docs recommend using copy.deepcopy for this, but
+                # it doesn't seem to preserve namespaces. It would be nice to find a less heavy-handed way of doing
+                # this.
+                payload = self._fromstring(self._tostring(payload))
+                payload = self._c14n(
+                    payload, algorithm=identity, inclusive_ns_prefixes=inclusive_ns_prefixes
+                )
+                c14n_applied = True
 
         if not c14n_applied and not isinstance(payload, (str, bytes)):
             # Create a separate copy of the node, see above
@@ -649,6 +772,8 @@ class XMLVerifier(XMLSignatureProcessor):
             payload,
             transforms_node=transforms,
             signature=copied_signature_ref,
+            reference_index=index,
+            reference_uri=reference.get("URI"),
         )
         digest_alg = DigestAlgorithm(digest_method_alg_name)
         self.check_digest_alg_expected(digest_alg)

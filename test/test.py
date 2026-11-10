@@ -19,6 +19,7 @@ import cryptography.exceptions
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import dsa, ec, rsa
+from cryptography.hazmat.primitives.asymmetric.padding import PKCS1v15
 from lxml import etree
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -1259,6 +1260,303 @@ class TestSignXML(unittest.TestCase, LoadExampleKeys):
         with self.assertRaisesRegex(InvalidInput, "Signature method RSA_SHA1 forbidden by configuration"):
             verifier.verify(signed, x509_cert=cert)
         verifier.verify(signed, x509_cert=cert, expect_config=sha1_ok_example_cert)
+
+
+class TestStrictTransformPolicy(unittest.TestCase, LoadExampleKeys):
+    enveloped_uri = SignatureConstructionMethod.enveloped.value
+    base64_uri = "http://www.w3.org/2000/09/xmldsig#base64"
+    c14n_uri = CanonicalizationMethod.CANONICAL_XML_1_1.value
+    xpath_uri = "http://www.w3.org/TR/1999/REC-xpath-19991116"
+    xslt_uri = "http://www.w3.org/TR/1999/REC-xslt-19991116"
+    strict_config = SignatureConfiguration(
+        strict_transform_policy=True, verification_time=example_cert_verification_time
+    )
+
+    def _copy_element(self, element):
+        return etree.fromstring(etree.tostring(element))
+
+    def _get_transforms_node(self, signed_root, reference_index=0):
+        references = signed_root.findall(".//ds:Reference", namespaces=namespaces)
+        return references[reference_index].find("ds:Transforms", namespaces=namespaces)
+
+    def _set_transform_chain(self, signed_root, transform_uris, reference_index=0):
+        mutated = self._copy_element(signed_root)
+        transforms_node = self._get_transforms_node(mutated, reference_index)
+        for child in list(transforms_node):
+            transforms_node.remove(child)
+        for uri in transform_uris:
+            etree.SubElement(transforms_node, ds_tag("Transform"), Algorithm=uri)
+        return mutated
+
+    def _resign(self, signed_root):
+        """
+        Re-sign a mutated signature so that the outer SignatureValue and the reference DigestValue are both valid
+        for the document as presented. Any rejection afterwards cannot be caused by a digest or signature mismatch.
+        """
+        from cryptography.hazmat.primitives.serialization import load_pem_private_key
+
+        _, key_pem = self.load_example_keys()
+        private_key = load_pem_private_key(key_pem, password=None)
+        resigned = self._copy_element(signed_root)
+
+        signed_info = resigned.find(".//ds:SignedInfo", namespaces=namespaces)
+        c14n_method = signed_info.find("ds:CanonicalizationMethod", namespaces=namespaces).get("Algorithm")
+        signature_method = SignatureMethod(
+            signed_info.find("ds:SignatureMethod", namespaces=namespaces).get("Algorithm")
+        )
+        verifier = XMLVerifier()
+        signed_info_c14n = verifier._c14n(
+            signed_info, algorithm=CanonicalizationMethod(c14n_method)
+        )
+        signature = private_key.sign(signed_info_c14n, padding=PKCS1v15(), algorithm=hashes.SHA256())
+        assert signature_method is SignatureMethod.RSA_SHA256
+        resigned.find(".//ds:SignatureValue", namespaces=namespaces).text = b64encode(signature).decode()
+        return resigned
+
+    def _recompute_digest(self, signed_root, reference_index=0):
+        """Recompute the reference DigestValue using the lenient transform processing path."""
+        mutated = self._copy_element(signed_root)
+        reference = mutated.findall(".//ds:Reference", namespaces=namespaces)[reference_index]
+        transforms_node = reference.find("ds:Transforms", namespaces=namespaces)
+        digest_alg = DigestAlgorithm(reference.find("ds:DigestMethod", namespaces=namespaces).get("Algorithm"))
+        verifier = XMLVerifier()
+        verifier.config = SignatureConfiguration()
+        copied_root = verifier._fromstring(verifier._tostring(mutated))
+        copied_signature = verifier._get_signature(copied_root)
+        payload = verifier._resolve_reference(copied_root, reference)
+        payload_c14n = verifier._apply_transforms(
+            payload,
+            transforms_node=transforms_node,
+            signature=copied_signature,
+            reference_index=reference_index,
+            reference_uri=reference.get("URI"),
+        )
+        reference.find("ds:DigestValue", namespaces=namespaces).text = b64encode(
+            verifier._get_digest(payload_c14n, digest_alg)
+        ).decode()
+        return mutated
+
+    def _make_valid_enveloped_signature(self):
+        cert, key = self.load_example_keys()
+        data = etree.fromstring(
+            '<root xmlns="http://example.com/ns1"><data Id="target"><value>1</value></data></root>'
+        )
+        signed_root = XMLSigner().sign(data, cert=cert, key=key, reference_uri="#target")
+        return cert, signed_root
+
+    def _assert_policy_rejection(self, signed_root, *, position, algorithm_fragment):
+        cert, _ = self.load_example_keys()
+        with self.assertRaises(InvalidInput) as context:
+            XMLVerifier().verify(signed_root, x509_cert=cert, expect_config=self.strict_config)
+        message = str(context.exception)
+        self.assertIn("Strict transform policy violation", message)
+        self.assertIn("reference 0", message)
+        self.assertIn(f"position {position}", message)
+        self.assertIn(algorithm_fragment, message)
+
+    def test_signer_generated_chains_pass_strict_policy(self):
+        cert, key = self.load_example_keys()
+        data = etree.fromstring(
+            '<root xmlns="http://example.com/ns1"><data Id="target"><value>1</value></data></root>'
+        )
+
+        # Default enveloped chain: enveloped-signature followed by canonicalization
+        enveloped = XMLSigner().sign(self._copy_element(data), cert=cert, key=key, reference_uri="#target")
+        XMLVerifier().verify(enveloped, x509_cert=cert, expect_config=self.strict_config)
+
+        # Enveloped chain with c14n transform omitted: enveloped-signature only, default c14n applied implicitly
+        enveloped_no_c14n = XMLSigner().sign(
+            self._copy_element(data), cert=cert, key=key, reference_uri="#target",
+            exclude_c14n_transform_element=True,
+        )
+        XMLVerifier().verify(enveloped_no_c14n, x509_cert=cert, expect_config=self.strict_config)
+
+        # Detached and enveloping chains carry canonicalization only (or no transforms), no enveloped-signature
+        detached = XMLSigner(method=methods.detached).sign(
+            self._copy_element(data), cert=cert, key=key, reference_uri="#target"
+        )
+        detached_doc = etree.fromstring(b"<root>" + etree.tostring(detached) + etree.tostring(data) + b"</root>")
+        XMLVerifier().verify(
+            detached_doc, x509_cert=cert, expect_config=replace(self.strict_config, expect_references=1)
+        )
+
+        enveloping = XMLSigner(method=methods.enveloping).sign(
+            etree.fromstring("<data>payload</data>"), cert=cert, key=key
+        )
+        XMLVerifier().verify(enveloping, x509_cert=cert, expect_config=self.strict_config)
+
+    def test_default_config_keeps_lenient_behavior(self):
+        cert, signed_root = self._make_valid_enveloped_signature()
+        # A chain with an unrecognized transform embedded among supported ones is ignored by default mode.
+        mutated = self._set_transform_chain(
+            signed_root, [self.enveloped_uri, self.xpath_uri, self.c14n_uri]
+        )
+        mutated = self._recompute_digest(mutated)
+        mutated = self._resign(mutated)
+        XMLVerifier().verify(mutated, x509_cert=cert, expect_config=example_cert_config)
+        # Strict mode rejects the same well-formed, cryptographically valid document.
+        self._assert_policy_rejection(mutated, position=1, algorithm_fragment=self.xpath_uri)
+
+    def test_unknown_transform_is_rejected(self):
+        cert, signed_root = self._make_valid_enveloped_signature()
+        for unknown_uri in (self.xpath_uri, self.xslt_uri, "http://example.com/custom-transform"):
+            with self.subTest(unknown_uri=unknown_uri):
+                mutated = self._set_transform_chain(signed_root, [unknown_uri, self.c14n_uri])
+                mutated = self._recompute_digest(mutated)
+                mutated = self._resign(mutated)
+                self._assert_policy_rejection(mutated, position=0, algorithm_fragment=unknown_uri)
+
+    def test_reordered_chain_is_rejected_not_silently_accepted(self):
+        cert, signed_root = self._make_valid_enveloped_signature()
+
+        # Canonicalization first, enveloped-signature second: lenient processing produces identical output to the
+        # valid chain, so only the policy can be responsible for the rejection.
+        reversed_chain = self._set_transform_chain(signed_root, [self.c14n_uri, self.enveloped_uri])
+        reversed_chain = self._recompute_digest(reversed_chain)
+        reversed_chain = self._resign(reversed_chain)
+        XMLVerifier().verify(reversed_chain, x509_cert=cert, expect_config=example_cert_config)
+        self._assert_policy_rejection(
+            reversed_chain, position=0, algorithm_fragment=self.c14n_uri
+        )
+
+        # Duplicate enveloped-signature transforms.
+        duplicated = self._set_transform_chain(
+            signed_root, [self.enveloped_uri, self.enveloped_uri, self.c14n_uri]
+        )
+        duplicated = self._recompute_digest(duplicated)
+        duplicated = self._resign(duplicated)
+        XMLVerifier().verify(duplicated, x509_cert=cert, expect_config=example_cert_config)
+        self._assert_policy_rejection(
+            duplicated, position=1, algorithm_fragment=self.enveloped_uri
+        )
+
+        # Duplicate canonicalization transforms. The lenient implementation has no meaningful semantics for a second
+        # c14n pass (it would feed the already-serialized bytes back into the c14n serializer), so strict mode is
+        # expected to reject the chain on its policy before any transform is applied. The digest is computed over the
+        # c14n output of the otherwise identical, supported chain (enveloped-signature + one c14n pass).
+        supported = self._set_transform_chain(signed_root, [self.enveloped_uri, self.c14n_uri])
+        supported = self._recompute_digest(supported)
+        supported_digest = supported.find(
+            ".//ds:Reference/ds:DigestValue", namespaces=namespaces
+        ).text
+        duplicated_c14n = self._set_transform_chain(
+            signed_root, [self.enveloped_uri, self.c14n_uri, self.c14n_uri]
+        )
+        duplicated_c14n.find(".//ds:Reference/ds:DigestValue", namespaces=namespaces).text = supported_digest
+        duplicated_c14n = self._resign(duplicated_c14n)
+        self._assert_policy_rejection(
+            duplicated_c14n, position=1, algorithm_fragment=self.c14n_uri
+        )
+
+    def test_base64_chain_ordering_is_enforced(self):
+        cert, key = self.load_example_keys()
+        payload_text = b"Hello, base64 transform!"
+        doc = etree.fromstring(
+            f'<data xmlns="http://example.com/ns1" Id="target">{b64encode(payload_text).decode()}</data>'
+        )
+
+        def build_with_chain(transform_uris):
+            signer = XMLSigner(method=methods.detached)
+            signed = signer.sign(self._copy_element(doc), cert=cert, key=key, reference_uri="#target")
+            full_doc = etree.fromstring(b"<root>" + etree.tostring(signed) + etree.tostring(doc) + b"</root>")
+            return self._set_transform_chain(full_doc, transform_uris)
+
+        # base64 as the only transform is a valid chain.
+        valid_b64 = build_with_chain([self.base64_uri])
+        valid_b64 = self._recompute_digest(valid_b64)
+        valid_b64 = self._resign(valid_b64)
+        result = XMLVerifier().verify(
+            valid_b64,
+            x509_cert=cert,
+            expect_config=replace(self.strict_config, expect_references=True),
+        )
+        self.assertEqual(result[0].signed_data, payload_text)
+
+        # base64 followed by canonicalization is a type-incompatible combination (bytes fed to a node-set transform)
+        # and also violates last-position ordering. Strict mode rejects it before touching the transforms. The digest
+        # is computed over the decoded base64 payload, i.e. the output the chain would have produced up to its last
+        # meaningful transform, so the outer signature and reference digest remain cryptographically valid.
+        b64_then_c14n = build_with_chain([self.base64_uri, self.c14n_uri])
+        b64_only = self._recompute_digest(build_with_chain([self.base64_uri]))
+        b64_digest = b64_only.find(".//ds:Reference/ds:DigestValue", namespaces=namespaces).text
+        b64_then_c14n.find(".//ds:Reference/ds:DigestValue", namespaces=namespaces).text = b64_digest
+        b64_then_c14n = self._resign(b64_then_c14n)
+        self._assert_policy_rejection(b64_then_c14n, position=0, algorithm_fragment=self.base64_uri)
+
+        # Duplicate base64 transforms. The digest is the single-base64 chain's digest (the output of the first
+        # decode), and the document is re-signed so only the transform policy can cause the rejection.
+        duplicated_b64 = build_with_chain([self.base64_uri, self.base64_uri])
+        duplicated_b64.find(".//ds:Reference/ds:DigestValue", namespaces=namespaces).text = b64_digest
+        duplicated_b64 = self._resign(duplicated_b64)
+        self._assert_policy_rejection(duplicated_b64, position=0, algorithm_fragment=self.base64_uri)
+
+    def test_transform_after_bytes_producing_chain_is_rejected(self):
+        cert, key = self.load_example_keys()
+        payload_text = b"binary detached payload"
+        doc = etree.fromstring(
+            f'<data xmlns="http://example.com/ns1" Id="target">{b64encode(payload_text).decode()}</data>'
+        )
+        signer = XMLSigner(method=methods.detached)
+        signed = signer.sign(self._copy_element(doc), cert=cert, key=key, reference_uri="#target")
+        full_doc = etree.fromstring(b"<root>" + etree.tostring(signed) + etree.tostring(doc) + b"</root>")
+
+        # A valid base64 chain turns the text node into bytes; appending an enveloped-signature transform then has no
+        # node-set left to operate on. The digest is taken from the valid base64-only chain and the document is
+        # re-signed, ensuring the policy check (not a signature mismatch) is what triggers the rejection.
+        valid_b64_doc = self._set_transform_chain(full_doc, [self.base64_uri])
+        valid_b64_doc = self._recompute_digest(valid_b64_doc)
+        valid_b64_doc = self._resign(valid_b64_doc)
+        bytes_then_enveloped = self._set_transform_chain(valid_b64_doc, [self.base64_uri, self.enveloped_uri])
+        bytes_then_enveloped = self._resign(bytes_then_enveloped)
+        with self.assertRaises(InvalidInput) as context:
+            XMLVerifier().verify(
+                bytes_then_enveloped,
+                x509_cert=cert,
+                expect_config=self.strict_config,
+            )
+        message = str(context.exception)
+        self.assertIn("Strict transform policy violation", message)
+        self.assertIn("reference 0", message)
+        self.assertIn("position 0", message)
+        self.assertIn(self.base64_uri, message)
+
+    def test_type_incompatible_chain_is_rejected(self):
+        # Directly exercise the validator with a chain whose first transform already produces bytes and whose second
+        # transform requires a node-set. This ordering cannot occur with last-position enforcement via document-level
+        # mutation, so the type-transition branch is covered at the validator level.
+        verifier = XMLVerifier()
+        verifier.config = self.strict_config
+        transforms_node = etree.Element(ds_tag("Transforms"))
+        etree.SubElement(transforms_node, ds_tag("Transform"), Algorithm=self.enveloped_uri)
+        etree.SubElement(transforms_node, ds_tag("Transform"), Algorithm=self.base64_uri)
+        etree.SubElement(transforms_node, ds_tag("Transform"), Algorithm=self.c14n_uri)
+        transforms = verifier._findall(transforms_node, "Transform")
+        with self.assertRaises(InvalidInput) as context:
+            verifier._validate_transform_chain(
+                transforms,
+                initial_payload=b"already bytes",
+                reference_index=2,
+                reference_uri="#external",
+            )
+        message = str(context.exception)
+        self.assertIn("Strict transform policy violation", message)
+        self.assertIn("reference 2", message)
+        self.assertIn("#external", message)
+        self.assertIn("position 0", message)
+        self.assertIn("already produced bytes", message)
+
+    def test_base64_transform_requires_text_node_input(self):
+        verifier = XMLVerifier()
+        verifier.config = self.strict_config
+        transforms_node = etree.Element(ds_tag("Transforms"))
+        etree.SubElement(transforms_node, ds_tag("Transform"), Algorithm=self.base64_uri)
+        transforms = verifier._findall(transforms_node, "Transform")
+        empty_element = etree.fromstring('<data xmlns="http://example.com/ns1" Id="target"/>')
+        with self.assertRaises(InvalidInput) as context:
+            verifier._validate_transform_chain(
+                transforms, initial_payload=empty_element, reference_index=0, reference_uri="#target"
+            )
+        self.assertIn("base64 transform requires an element node with text content", str(context.exception))
 
 
 class TestXAdES(unittest.TestCase, LoadExampleKeys):

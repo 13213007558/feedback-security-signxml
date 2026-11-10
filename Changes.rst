@@ -1,3 +1,12 @@
+Unreleased
+==========
+
+-  Add an opt-in strict transform policy (``SignatureConfiguration(strict_transform_policy=True)``). When enabled,
+   each reference's transform chain is validated in declaration order before being applied. Unknown or unsupported
+   transforms (including XPath and XSLT), duplicate transforms, meaningless orderings, and combinations
+   incompatible with the node-set/bytes data flow are rejected with an ``InvalidInput`` error that identifies the
+   reference and the offending transform position. The default lenient verification behavior is unchanged.
+
 Changes for v5.2.0 (2026-10-18)
 ===============================
 

@@ -56,6 +56,17 @@ class InvalidInputErrorMixin:
         return f"{self.__class__.__name__}.{enum_self.name}"
 
 
+class TransformAlgorithm(InvalidInputErrorMixin, Enum):
+    """
+    An enumeration of non-canonicalization transform algorithms supported by SignXML. Canonicalization transforms are
+    enumerated separately in :class:`CanonicalizationMethod`. See the
+    `XML Signature 1.1 transform algorithms <http://www.w3.org/TR/xmldsig-core1/#sec-Transforms>`_ section for details.
+    """
+
+    ENVELOPED_SIGNATURE = "http://www.w3.org/2000/09/xmldsig#enveloped-signature"
+    BASE64 = "http://www.w3.org/2000/09/xmldsig#base64"
+
+
 class DigestAlgorithm(FragmentLookupMixin, InvalidInputErrorMixin, Enum):
     """
     An enumeration of digest algorithms supported by SignXML.  See the
