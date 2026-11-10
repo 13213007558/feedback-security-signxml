@@ -41,7 +41,8 @@ from signxml import (
     namespaces,
     processor,
 )
-from signxml.util import ds_tag
+from signxml.algorithms import digest_algorithm_implementations
+from signxml.util import ds_tag, xades_tag
 from signxml.xades import (
     XAdESDataObjectFormat,
     XAdESSignatureConfiguration,
@@ -1379,6 +1380,323 @@ class TestXAdES(unittest.TestCase, LoadExampleKeys):
                     break
             else:
                 XAdESVerifier().verify(doc, **kwargs)
+
+
+def make_self_signed_cert(key, common_name, serial_number, not_before, not_after):
+    name = x509.Name(
+        [
+            x509.NameAttribute(x509.oid.NameOID.COUNTRY_NAME, "US"),
+            x509.NameAttribute(x509.oid.NameOID.ORGANIZATION_NAME, "SignXML Test"),
+            x509.NameAttribute(x509.oid.NameOID.ORGANIZATIONAL_UNIT_NAME, "XAdES"),
+            x509.NameAttribute(x509.oid.NameOID.COMMON_NAME, common_name),
+        ]
+    )
+    return (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(serial_number)
+        .not_valid_before(not_before)
+        .not_valid_after(not_after)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=False,
+                crl_sign=False,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .sign(key, hashes.SHA256())
+    )
+
+
+class DeclaredCertXAdESSigner(XAdESSigner):
+    """
+    XAdES signer that declares arbitrary certificates in SigningCertificate/SigningCertificateV2,
+    independent of the certificate chain written to KeyInfo. The SignedProperties it emits are
+    signed normally, so any verification failure comes from the certificate binding declared in
+    the signature properties, not from a broken outer signature.
+    """
+
+    def __init__(self, *args, declared_certs, emit_v1=False, emit_v2=True, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.declared_certs = declared_certs
+        self.emit_v1 = emit_v1
+        self.emit_v2 = emit_v2
+        self.signed_signature_properties_annotators = [
+            self.add_signing_time,
+            self.add_declared_signing_certificate,
+            self.add_signature_policy_identifier,
+            self.add_signature_production_place,
+            self.add_signer_role,
+        ]
+
+    def _add_cert_node(self, parent, cert, digest_alg, with_issuer_serial):
+        cert_node = etree.SubElement(parent, xades_tag("Cert"), nsmap=self.namespaces)
+        cert_digest = etree.SubElement(cert_node, xades_tag("CertDigest"), nsmap=self.namespaces)
+        etree.SubElement(cert_digest, ds_tag("DigestMethod"), nsmap=self.namespaces, Algorithm=digest_alg.value)
+        digest_value_node = etree.SubElement(cert_digest, ds_tag("DigestValue"), nsmap=self.namespaces)
+        digest_value_node.text = b64encode(cert.fingerprint(digest_algorithm_implementations[digest_alg]())).decode()
+        if with_issuer_serial:
+            issuer_serial = etree.SubElement(cert_node, xades_tag("IssuerSerial"), nsmap=self.namespaces)
+            issuer_name = etree.SubElement(issuer_serial, ds_tag("X509IssuerName"), nsmap=self.namespaces)
+            issuer_name.text = cert.issuer.rfc4514_string()
+            serial_number = etree.SubElement(issuer_serial, ds_tag("X509SerialNumber"), nsmap=self.namespaces)
+            serial_number.text = str(cert.serial_number)
+
+    def add_declared_signing_certificate(self, signed_signature_properties, sig_root, signing_settings):
+        if self.emit_v1:
+            signing_cert = etree.SubElement(
+                signed_signature_properties, xades_tag("SigningCertificate"), nsmap=self.namespaces
+            )
+            for cert in self.declared_certs:
+                self._add_cert_node(signing_cert, cert, DigestAlgorithm.SHA1, with_issuer_serial=True)
+        if self.emit_v2:
+            signing_cert_v2 = etree.SubElement(
+                signed_signature_properties, xades_tag("SigningCertificateV2"), nsmap=self.namespaces
+            )
+            for cert in self.declared_certs:
+                self._add_cert_node(signing_cert_v2, cert, self.digest_alg, with_issuer_serial=False)
+
+
+class RecordingXAdESVerifier(XAdESVerifier):
+    """
+    XAdES verifier that records which certificate it ultimately bound the signature to, and
+    which SignedProperties element was being checked when certificate digest verification ran.
+    """
+
+    def _find_signing_cert(self, verify_result, certs):
+        self.used_signing_cert = super()._find_signing_cert(verify_result, certs)
+        return self.used_signing_cert
+
+    def _verify_cert_digest(self, signing_cert_node, certs, signing_cert):
+        self.checked_property = etree.QName(signing_cert_node).localname
+        return super()._verify_cert_digest(signing_cert_node, certs=certs, signing_cert=signing_cert)
+
+
+class TestXAdESSameKeyDifferentCerts(unittest.TestCase):
+    """
+    Regression tests for XAdES signatures where two certificates share one public key but carry
+    different identities (issuer, serial number, validity period). Both certificates can verify
+    the same signature value, but the certificate digest declared in SigningCertificate(V2) binds
+    the signature to exactly one recognized identity.
+
+    Expected behavior per the currently supported XAdES rules:
+    - The signing certificate is the externally supplied x509_cert if given, otherwise the first
+      KeyInfo certificate whose public key matches the signature key.
+    - Every declared Cert digest must match some certificate available to the verifier, and the
+      first declared Cert (the signing certificate reference) must match the signing certificate;
+      subsequent Cert entries are chain certificate references checked against any known cert.
+    - Exactly one of SigningCertificate / SigningCertificateV2 may be present.
+    """
+
+    verification_time = datetime(2026, 6, 1, tzinfo=timezone.utc)
+
+    @classmethod
+    def setUpClass(cls):
+        cls.key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        cls.cert_a = make_self_signed_cert(
+            cls.key,
+            common_name="Recognized Signer",
+            serial_number=1001,
+            not_before=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            not_after=datetime(2027, 1, 1, tzinfo=timezone.utc),
+        )
+        cls.cert_b = make_self_signed_cert(
+            cls.key,
+            common_name="Unrecognized Signer",
+            serial_number=2002,
+            not_before=datetime(2026, 3, 1, tzinfo=timezone.utc),
+            not_after=datetime(2026, 12, 1, tzinfo=timezone.utc),
+        )
+        cls.xades_config = XAdESSignatureConfiguration(
+            signature_methods=list(SignatureMethod),
+            digest_algorithms=list(DigestAlgorithm),
+            verification_time=cls.verification_time,
+        )
+        cls.plain_config = replace(sha1_ok, verification_time=cls.verification_time, expect_references=3)
+        # Local trust store containing both self-signed certificates; no external OCSP or
+        # trust service is consulted, and verification runs at a fixed verification time.
+        ca_file = tempfile.NamedTemporaryFile(suffix=".pem", delete=False)
+        cls.addClassCleanup(os.unlink, ca_file.name)
+        with ca_file:
+            ca_file.write(cls.cert_a.public_bytes(serialization.Encoding.PEM))
+            ca_file.write(cls.cert_b.public_bytes(serialization.Encoding.PEM))
+        cls.ca_pem_file = ca_file.name
+
+    def setUp(self):
+        with open(os.path.join(os.path.dirname(__file__), "example.xml"), "rb") as fh:
+            self.doc = etree.parse(fh)
+
+    def sign(self, key_info_certs, declared_certs, emit_v1=False, emit_v2=True):
+        signer = DeclaredCertXAdESSigner(
+            signature_policy=TestXAdES.signature_policy,
+            claimed_roles=TestXAdES.claimed_roles,
+            data_object_format=TestXAdES.data_object_format,
+            declared_certs=declared_certs,
+            emit_v1=emit_v1,
+            emit_v2=emit_v2,
+        )
+        return signer.sign(self.doc, key=self.key, cert=key_info_certs)
+
+    def verify(self, signed_doc, x509_cert=None):
+        verifier = RecordingXAdESVerifier()
+        kwargs = {}
+        if x509_cert is not None:
+            kwargs["x509_cert"] = x509_cert
+        verifier.verify(
+            signed_doc,
+            expect_references=3,
+            expect_signature_policy=TestXAdES.signature_policy,
+            expect_config=self.xades_config,
+            ca_pem_file=self.ca_pem_file,
+            **kwargs,
+        )
+        return verifier
+
+    def assert_signature_layer_ok(self, signed_doc, cert):
+        # The outer XML signature must verify with either same-key certificate, so that any
+        # XAdES-level failure below comes from the certificate binding, not a broken signature.
+        verify_results = XMLVerifier().verify(signed_doc, x509_cert=cert, expect_config=self.plain_config)
+        self.assertEqual(3, len(verify_results))
+
+    def assert_cert_binding_fails(self, signed_doc, x509_cert, error_regex, expected_used_cert, expected_property):
+        self.assert_signature_layer_ok(signed_doc, x509_cert)
+        verifier = RecordingXAdESVerifier()
+        with self.assertRaisesRegex(InvalidDigest, error_regex):
+            verifier.verify(
+                signed_doc,
+                x509_cert=x509_cert,
+                expect_references=3,
+                expect_signature_policy=TestXAdES.signature_policy,
+                expect_config=self.xades_config,
+                ca_pem_file=self.ca_pem_file,
+            )
+        self.assertEqual(expected_used_cert, verifier.used_signing_cert)
+        self.assertEqual(expected_property, verifier.checked_property)
+
+    def test_same_key_both_certs_verify_signature_value(self):
+        # Premise: both certificates wrap the same public key, so the plain XML signature
+        # layer accepts either one for the very same signed document.
+        signed_doc = self.sign([self.cert_a], [self.cert_a])
+        self.assert_signature_layer_ok(signed_doc, self.cert_a)
+        self.assert_signature_layer_ok(signed_doc, self.cert_b)
+
+    def test_declared_identity_matches_first_keyinfo_cert(self):
+        # Success control: KeyInfo [A, B], declared [A, B], no external cert. The verifier
+        # binds to the first KeyInfo cert with a matching key (A); the first declared Cert is
+        # the signing certificate reference and the second is a chain certificate reference.
+        signed_doc = self.sign([self.cert_a, self.cert_b], [self.cert_a, self.cert_b])
+        verifier = self.verify(signed_doc)
+        self.assertEqual(self.cert_a, verifier.used_signing_cert)
+        self.assertEqual("SigningCertificateV2", verifier.checked_property)
+
+    def test_declared_identity_matches_external_x509_cert(self):
+        # Success control: KeyInfo [B, A] but x509_cert=A. The external certificate parameter
+        # wins over KeyInfo order, and the declared digest of A is accepted.
+        signed_doc = self.sign([self.cert_b, self.cert_a], [self.cert_a, self.cert_b])
+        verifier = self.verify(signed_doc, x509_cert=self.cert_a)
+        self.assertEqual(self.cert_a, verifier.used_signing_cert)
+
+    def test_keyinfo_order_selects_other_identity(self):
+        # KeyInfo [B, A], declared signing cert A, no external cert: the verifier binds to B
+        # (first KeyInfo cert with a matching key), so the declared digest of A is rejected
+        # at the signing certificate binding layer.
+        signed_doc = self.sign([self.cert_b, self.cert_a], [self.cert_a, self.cert_b])
+        self.assert_signature_layer_ok(signed_doc, self.cert_b)
+        verifier = RecordingXAdESVerifier()
+        with self.assertRaisesRegex(InvalidDigest, "Digest mismatch for signing certificate digest"):
+            verifier.verify(
+                signed_doc,
+                expect_references=3,
+                expect_signature_policy=TestXAdES.signature_policy,
+                expect_config=self.xades_config,
+                ca_pem_file=self.ca_pem_file,
+            )
+        self.assertEqual(self.cert_b, verifier.used_signing_cert)
+        self.assertEqual("SigningCertificateV2", verifier.checked_property)
+
+    def test_external_x509_cert_other_identity(self):
+        # KeyInfo [A], declared A, but x509_cert=B: B's key verifies the signature value, yet
+        # the declared digest binds the signature to A, so verification fails at the signing
+        # certificate binding layer.
+        signed_doc = self.sign([self.cert_a], [self.cert_a])
+        self.assert_cert_binding_fails(
+            signed_doc,
+            x509_cert=self.cert_b,
+            error_regex="Digest mismatch for signing certificate digest",
+            expected_used_cert=self.cert_b,
+            expected_property="SigningCertificateV2",
+        )
+
+    def test_declared_cert_absent_from_keyinfo(self):
+        # KeyInfo [A], declared B, x509_cert=A: B's digest matches no certificate available to
+        # the verifier, so verification fails at the certificate digest layer.
+        signed_doc = self.sign([self.cert_a], [self.cert_b])
+        self.assert_cert_binding_fails(
+            signed_doc,
+            x509_cert=self.cert_a,
+            error_regex="^Digest mismatch for certificate digest$",
+            expected_used_cert=self.cert_a,
+            expected_property="SigningCertificateV2",
+        )
+
+    def test_chain_cert_declared_as_signing_cert(self):
+        # KeyInfo [A, B], declared [B, A]: every declared digest matches some known
+        # certificate, but the first declared Cert (the signing certificate reference) points
+        # at chain certificate B while the recognized identity is A.
+        signed_doc = self.sign([self.cert_a, self.cert_b], [self.cert_b, self.cert_a])
+        self.assert_cert_binding_fails(
+            signed_doc,
+            x509_cert=self.cert_a,
+            error_regex="Digest mismatch for signing certificate digest",
+            expected_used_cert=self.cert_a,
+            expected_property="SigningCertificateV2",
+        )
+
+    def test_legacy_signing_certificate_v1_only(self):
+        # Success control with only the legacy SigningCertificate (SHA1 digest) present.
+        signed_doc = self.sign([self.cert_a], [self.cert_a], emit_v1=True, emit_v2=False)
+        verifier = self.verify(signed_doc, x509_cert=self.cert_a)
+        self.assertEqual(self.cert_a, verifier.used_signing_cert)
+        self.assertEqual("SigningCertificate", verifier.checked_property)
+
+    def test_legacy_signing_certificate_v1_other_identity(self):
+        # Only SigningCertificate present, declaring B while KeyInfo carries A.
+        signed_doc = self.sign([self.cert_a], [self.cert_b], emit_v1=True, emit_v2=False)
+        self.assert_cert_binding_fails(
+            signed_doc,
+            x509_cert=self.cert_a,
+            error_regex="^Digest mismatch for certificate digest$",
+            expected_used_cert=self.cert_a,
+            expected_property="SigningCertificate",
+        )
+
+    def test_both_signing_certificate_versions_rejected(self):
+        # Current rule: exactly one of SigningCertificate / SigningCertificateV2 may be
+        # present, even when both declare the correct certificate.
+        signed_doc = self.sign([self.cert_a], [self.cert_a], emit_v1=True, emit_v2=True)
+        self.assert_signature_layer_ok(signed_doc, self.cert_a)
+        verifier = RecordingXAdESVerifier()
+        with self.assertRaisesRegex(
+            InvalidInput, "Expected to find exactly one of xades:SigningCertificate or xades:SigningCertificateV2"
+        ):
+            verifier.verify(
+                signed_doc,
+                x509_cert=self.cert_a,
+                expect_references=3,
+                expect_signature_policy=TestXAdES.signature_policy,
+                expect_config=self.xades_config,
+                ca_pem_file=self.ca_pem_file,
+            )
+        self.assertEqual(self.cert_a, verifier.used_signing_cert)
 
 
 if __name__ == "__main__":
