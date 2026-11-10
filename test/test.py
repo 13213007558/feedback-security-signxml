@@ -19,6 +19,7 @@ import cryptography.exceptions
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import dsa, ec, rsa
+from cryptography.hazmat.primitives.hmac import HMAC
 from lxml import etree
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -29,6 +30,7 @@ from signxml import (
     InvalidDigest,
     InvalidInput,
     InvalidSignature,
+    ReferenceConstraint,
     SignatureConfiguration,
     SignatureConstructionMethod,
     SignatureMethod,
@@ -1259,6 +1261,145 @@ class TestSignXML(unittest.TestCase, LoadExampleKeys):
         with self.assertRaisesRegex(InvalidInput, "Signature method RSA_SHA1 forbidden by configuration"):
             verifier.verify(signed, x509_cert=cert)
         verifier.verify(signed, x509_cert=cert, expect_config=sha1_ok_example_cert)
+
+
+class TestReferenceConstraints(unittest.TestCase):
+    hmac_key = b"test-reference-constraints-key"
+    constraints = (
+        ReferenceConstraint(role="body", location="./Body"),
+        ReferenceConstraint(role="authorization-statement", location="./AuthorizationStatement"),
+    )
+
+    def make_signed(self, reference_uri):
+        data = etree.fromstring(
+            "<Response>"
+            '<Body Id="body">payload</Body>'
+            '<AuthorizationStatement Id="authz">allowed</AuthorizationStatement>'
+            '<Extra Id="extra">e</Extra>'
+            "</Response>"
+        )
+        signer = XMLSigner(
+            method=methods.enveloped,
+            signature_algorithm=SignatureMethod.HMAC_SHA256,
+            digest_algorithm=DigestAlgorithm.SHA256,
+        )
+        return signer.sign(data, key=self.hmac_key, reference_uri=reference_uri)
+
+    def make_config(self, constraints, **kwargs):
+        return replace(hmac_only, require_x509=False, reference_constraints=constraints, **kwargs)
+
+    def verify(self, signed, config):
+        return XMLVerifier().verify(etree.tostring(signed), hmac_key=self.hmac_key, expect_config=config)
+
+    def test_reference_constraints_two_reference_orders(self):
+        for reference_uri in (["body", "authz"], ["authz", "body"]):
+            signed = self.make_signed(reference_uri)
+            results = self.verify(signed, self.make_config(self.constraints))
+            self.assertIsInstance(results, dict)
+            self.assertEqual({"body", "authorization-statement"}, set(results))
+            self.assertEqual("Body", results["body"].signed_xml.tag)
+            self.assertEqual("payload", results["body"].signed_xml.text)
+            self.assertEqual("AuthorizationStatement", results["authorization-statement"].signed_xml.tag)
+            self.assertEqual("allowed", results["authorization-statement"].signed_xml.text)
+
+    def test_reference_constraints_compat_entry_without_constraints(self):
+        signed = self.make_signed(["body", "authz"])
+        results = XMLVerifier().verify(
+            etree.tostring(signed),
+            hmac_key=self.hmac_key,
+            expect_config=replace(hmac_only, require_x509=False, expect_references=2),
+        )
+        self.assertIsInstance(results, list)
+        self.assertEqual(2, len(results))
+        self.assertIsInstance(results[0], VerifyResult)
+
+    def test_reference_constraints_signature_wrapping(self):
+        signed = self.make_signed(["body", "authz"])
+        # Relocate the signed authorization statement and place a forged, unsigned one at the expected location
+        authz = signed.find("AuthorizationStatement")
+        signed.remove(authz)
+        wrapper = etree.SubElement(signed, "Wrapper")
+        wrapper.append(authz)
+        forged = etree.Element("AuthorizationStatement")
+        forged.text = "denied"
+        signed.insert(0, forged)
+
+        with self.assertRaisesRegex(InvalidSignature, "does not match any declared role"):
+            self.verify(signed, self.make_config(self.constraints))
+        with self.assertRaisesRegex(InvalidSignature, "not covered by any verified reference"):
+            self.verify(signed, self.make_config(self.constraints, allow_extra_references=True))
+
+    def test_reference_constraints_empty_uri(self):
+        data = etree.fromstring('<Response><Body Id="body">payload</Body></Response>')
+        signer = XMLSigner(
+            method=methods.enveloped,
+            signature_algorithm=SignatureMethod.HMAC_SHA256,
+            digest_algorithm=DigestAlgorithm.SHA256,
+        )
+        signed = signer.sign(data, key=self.hmac_key)
+        reference = signed.find(".//ds:SignedInfo/ds:Reference", namespaces=namespaces)
+        self.assertEqual("", reference.get("URI"))
+        config = self.make_config((ReferenceConstraint(role="document", location="/Response"),))
+        results = self.verify(signed, config)
+        self.assertEqual("Response", results["document"].signed_xml.tag)
+        self.assertEqual("payload", results["document"].signed_xml.find("Body").text)
+
+    def test_reference_constraints_tampered_digest(self):
+        # Tampering with signed content invalidates the digest even though the URI text is unchanged
+        signed = self.make_signed(["body", "authz"])
+        signed.find("Body").text = "forged"
+        with self.assertRaisesRegex(InvalidDigest, "Digest mismatch"):
+            self.verify(signed, self.make_config(self.constraints))
+
+        # A tampered DigestValue under a validly re-signed SignedInfo must still fail digest verification
+        signed = self.make_signed(["body", "authz"])
+        signed_info = signed.find(".//ds:SignedInfo", namespaces=namespaces)
+        digest_value = signed_info.find("ds:Reference/ds:DigestValue", namespaces=namespaces)
+        digest_value.text = b64encode(b"\x00" * 32).decode()
+        signed_info_c14n = XMLSignatureProcessor()._c14n(
+            signed_info, algorithm=CanonicalizationMethod.CANONICAL_XML_1_1
+        )
+        hmac_signer = HMAC(key=self.hmac_key, algorithm=hashes.SHA256())
+        hmac_signer.update(signed_info_c14n)
+        signed.find(".//ds:SignatureValue", namespaces=namespaces).text = b64encode(hmac_signer.finalize()).decode()
+        with self.assertRaisesRegex(InvalidDigest, "Digest mismatch"):
+            self.verify(signed, self.make_config(self.constraints))
+
+    def test_reference_constraints_missing_role(self):
+        signed = self.make_signed(["body", "authz"])
+        constraints = self.constraints + (ReferenceConstraint(role="timestamp", location="./Timestamp"),)
+        with self.assertRaisesRegex(InvalidSignature, "Required role 'timestamp' is not covered"):
+            self.verify(signed, self.make_config(constraints))
+
+    def test_reference_constraints_duplicate_role_occupancy(self):
+        signed = self.make_signed(["body", "body"])
+        with self.assertRaisesRegex(InvalidSignature, "claimed by more than one reference"):
+            self.verify(signed, self.make_config(self.constraints))
+
+    def test_reference_constraints_target_impersonating_two_roles(self):
+        signed = self.make_signed(["body", "authz"])
+        constraints = (
+            ReferenceConstraint(role="body", location="./Body"),
+            ReferenceConstraint(role="authorization-statement", location="./Body | ./AuthorizationStatement"),
+        )
+        with self.assertRaisesRegex(InvalidSignature, "matches multiple declared roles"):
+            self.verify(signed, self.make_config(constraints))
+
+    def test_reference_constraints_extra_references_policy(self):
+        signed = self.make_signed(["body", "authz", "extra"])
+        with self.assertRaisesRegex(InvalidSignature, "does not match any declared role"):
+            self.verify(signed, self.make_config(self.constraints))
+        results = self.verify(signed, self.make_config(self.constraints, allow_extra_references=True))
+        self.assertEqual({"body", "authorization-statement"}, set(results))
+
+    def test_reference_constraints_duplicate_role_names(self):
+        signed = self.make_signed(["body", "authz"])
+        constraints = (
+            ReferenceConstraint(role="body", location="./Body"),
+            ReferenceConstraint(role="body", location="./AuthorizationStatement"),
+        )
+        with self.assertRaisesRegex(InvalidInput, "duplicate role names"):
+            self.verify(signed, self.make_config(constraints))
 
 
 class TestXAdES(unittest.TestCase, LoadExampleKeys):

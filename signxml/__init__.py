@@ -8,6 +8,6 @@ from .exceptions import InvalidCertificate, InvalidDigest, InvalidInput, Invalid
 from .processor import XMLSignatureProcessor
 from .signer import SignatureReference, XMLSigner
 from .util import namespaces
-from .verifier import SignatureConfiguration, VerifyResult, XMLVerifier
+from .verifier import ReferenceConstraint, SignatureConfiguration, VerifyResult, XMLVerifier
 
 methods = SignatureConstructionMethod

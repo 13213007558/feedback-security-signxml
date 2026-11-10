@@ -142,6 +142,41 @@ Assuming ``metadata.xml`` contains SAML metadata for the assertion source:
     )
     verified_data = XMLVerifier().verify(data, expect_config=config).signed_xml
 
+Declaring required references: role-based constraints
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When a signature must cover both a message body and an authorization statement, checking the reference
+*count* (``expect_references=2``) is not enough: it does not tell you *which* parts of the document were
+actually signed, or where they appear. Instead, declare the business roles that must be covered by verified
+references, along with the locations where each role's target is allowed to appear:
+
+.. code-block:: python
+
+    from signxml import XMLVerifier, SignatureConfiguration, ReferenceConstraint
+
+    config = SignatureConfiguration(
+        require_x509=False,
+        reference_constraints=(
+            ReferenceConstraint(role="body", location="./Body"),
+            ReferenceConstraint(role="authorization-statement", location="./AuthorizationStatement"),
+        ),
+    )
+    results = XMLVerifier().verify(signed_xml, hmac_key=shared_secret, expect_config=config)
+
+    # The authorization decision reads only the verified "authorization-statement" role.
+    # Unsigned or unverified parts of the document are never consulted.
+    statement = results["authorization-statement"].signed_xml
+    if statement is not None and statement.text == "allowed":
+        grant_access()
+
+Constraints are matched against the fully verified reference targets (digest and transforms checked first),
+independently of the order in which ``ds:Reference`` elements appear in the signature. A missing role, two
+references claiming the same role, a single target matching two roles, and undeclared extra references all
+cause verification to fail, and no partial results are returned on failure. Extra references can be tolerated
+explicitly by setting ``allow_extra_references=True``; they are then excluded from the returned dict. The
+``location`` XPath is evaluated against the document root, and matching uses the actual resolved node
+position in the document - never the ``URI`` attribute text - so a signed node that has been moved elsewhere
+in the document (as in signature wrapping attacks) will not satisfy the constraint.
+
 Relaxing digital signature key usage extension validation for certificates
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 When verifying X.509 certificate chains, SignXML's default end-entity certificate policy requires the

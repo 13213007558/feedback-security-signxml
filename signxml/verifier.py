@@ -35,6 +35,31 @@ from .util import (
 
 
 @dataclass(frozen=True)
+class ReferenceConstraint:
+    """
+    A container declaring that a verified reference must cover a specific business role, and where in the
+    document the referenced node is allowed to appear. Constraints are matched against the fully verified
+    reference targets (after digest and transform validation), independently of the order in which
+    ``ds:Reference`` elements appear in ``ds:SignedInfo``.
+    """
+
+    role: str
+    """
+    Application-defined name of the business role covered by the reference (for example ``"body"`` or
+    ``"authorization-statement"``). When reference constraints are configured, :func:`XMLVerifier.verify`
+    returns its results in a dict keyed by this role name.
+    """
+
+    location: str | None = None
+    """
+    XPath expression, evaluated against the document root, selecting the node(s) where the referenced target
+    for this role is allowed to appear. The verified target node must be one of the selected nodes; matching is
+    performed on the actual resolved node position in the document, never on the ``URI`` attribute text. If
+    ``None``, any verified reference target (including external or detached targets) is accepted for this role.
+    """
+
+
+@dataclass(frozen=True)
 class SignatureConfiguration:
     """
     A container holding signature settings that will be used to assert properties of the signature.
@@ -64,6 +89,25 @@ class SignatureConfiguration:
     """
     Number of references to expect in the signature. If this is not 1, an array of VerifyResults is returned.
     If set to a non-integer, any number of references is accepted (otherwise a mismatch raises an error).
+    This count check is superseded by **reference_constraints** when the latter is set.
+    """
+
+    reference_constraints: tuple[ReferenceConstraint, ...] | None = None
+    """
+    Optional tuple of :class:`ReferenceConstraint` objects declaring which business roles must be covered by
+    verified references, and where in the document each role's target is allowed to appear. When set, every
+    declared role must be covered by exactly one verified reference, and ``verify()`` returns a dict mapping
+    each role name to its :class:`VerifyResult`. Missing roles, multiple references claiming the same role, a
+    single reference target matching multiple roles, and undeclared extra references all cause verification to
+    fail (see **allow_extra_references**). On failure, no partial results are returned.
+    """
+
+    allow_extra_references: bool = False
+    """
+    Explicit policy for references that do not match any role declared in **reference_constraints**. If
+    ``False`` (the default), any verified reference not claimed by a declared role causes verification to fail.
+    If ``True``, such extra references are tolerated but are not included in the role-indexed result dict.
+    This setting has no effect when **reference_constraints** is not set.
     """
 
     signature_methods: frozenset[SignatureMethod] = frozenset(sm for sm in SignatureMethod if "SHA1" not in sm.name)
@@ -367,12 +411,16 @@ class XMLVerifier(XMLSignatureProcessor):
         ee_policy: x509.verification.ExtensionPolicy | None = None,
         ca_policy: x509.verification.ExtensionPolicy | None = None,
         **deprecated_kwargs,
-    ) -> VerifyResult | list[VerifyResult]:
+    ) -> VerifyResult | list[VerifyResult] | dict[str, VerifyResult]:
         """
         Verify the XML signature supplied in the data and return a list of :class:`VerifyResult` data structures
         representing the data signed by the signature, or raise an exception if the signature is not valid. By default,
         this requires the signature to be generated using a valid X.509 certificate. To enable other means of signature
         validation, set ``expect_config`` to a configuration with the **require_x509** parameter set to `False`.
+
+        If ``expect_config`` declares **reference_constraints**, the return value is instead a dict mapping each
+        declared role name to its :class:`VerifyResult`, and every declared role must be covered by exactly one
+        verified reference for verification to succeed.
 
         .. admonition:: See what is signed
 
@@ -614,9 +662,17 @@ class XMLVerifier(XMLSignatureProcessor):
 
         verified_signed_info = self._fromstring(verified_signed_info_c14n)
         verify_results: list[VerifyResult] = []
+        target_paths: list[str | None] = []
         for idx, reference in enumerate(self._findall(verified_signed_info, "Reference")):
-            verify_results.append(
-                self._verify_reference(reference, idx, root, uri_resolver, c14n_algorithm, signature, key_used)
+            verify_result, target_path = self._verify_reference(
+                reference, idx, root, uri_resolver, c14n_algorithm, signature, key_used
+            )
+            verify_results.append(verify_result)
+            target_paths.append(target_path)
+
+        if self.config.reference_constraints is not None:
+            return self._apply_reference_constraints(
+                verify_results, target_paths, root, self._findall(verified_signed_info, "Reference")
             )
 
         if type(self.config.expect_references) is int and len(verify_results) != self.config.expect_references:
@@ -628,6 +684,65 @@ class XMLVerifier(XMLSignatureProcessor):
             if type(self.config.expect_references) is int and self.config.expect_references == 1
             else verify_results
         )
+
+    def _apply_reference_constraints(
+        self,
+        verify_results: list[VerifyResult],
+        target_paths: list[str | None],
+        root,
+        references,
+    ) -> dict[str, VerifyResult]:
+        constraints = self.config.reference_constraints
+        assert constraints is not None
+        roles = [constraint.role for constraint in constraints]
+        if len(set(roles)) != len(roles):
+            raise InvalidInput("reference_constraints contains duplicate role names")
+
+        allowed_paths: dict[str, set[str] | None] = {}
+        for constraint in constraints:
+            if constraint.location is None:
+                allowed_paths[constraint.role] = None
+            else:
+                nodes = root.xpath(constraint.location, namespaces=namespaces)
+                allowed_paths[constraint.role] = {root.getroottree().getpath(node) for node in nodes}
+
+        matched_roles: dict[str, int] = {}
+        role_for_ref: dict[int, str] = {}
+        for ref_idx, target_path in enumerate(target_paths):
+            matching_roles = [
+                role
+                for role, paths in allowed_paths.items()
+                if paths is None or (target_path is not None and target_path in paths)
+            ]
+            uri = references[ref_idx].get("URI")
+            if len(matching_roles) > 1:
+                msg = "Reference {} ({!r}) matches multiple declared roles: {}"
+                raise InvalidSignature(msg.format(ref_idx, uri, ", ".join(sorted(matching_roles))))
+            if len(matching_roles) == 0:
+                if self.config.allow_extra_references:
+                    continue
+                msg = "Reference {} ({!r}) does not match any declared role"
+                raise InvalidSignature(msg.format(ref_idx, uri))
+            role = matching_roles[0]
+            if role in matched_roles:
+                msg = "Role {!r} is claimed by more than one reference (indexes {} and {})"
+                raise InvalidSignature(msg.format(role, matched_roles[role], ref_idx))
+            matched_roles[role] = ref_idx
+            role_for_ref[ref_idx] = role
+
+        target_by_role: dict[str, str | None] = {}
+        for role, ref_idx in matched_roles.items():
+            target_path = target_paths[ref_idx]
+            if target_path is not None and target_path in target_by_role.values():
+                msg = "References for roles {!r} resolve to the same target node {!r}"
+                raise InvalidSignature(msg.format(role, target_path))
+            target_by_role[role] = target_path
+
+        for role in roles:
+            if role not in matched_roles:
+                raise InvalidSignature(f"Required role {role!r} is not covered by any verified reference")
+
+        return {role: verify_results[matched_roles[role]] for role in roles}
 
     def _verify_reference(
         self,
@@ -645,6 +760,11 @@ class XMLVerifier(XMLSignatureProcessor):
         digest_method_alg_name = self._find(reference, "DigestMethod").get("Algorithm")
         digest_value = self._find(reference, "DigestValue")
         payload = self._resolve_reference(copied_root, reference, uri_resolver=uri_resolver)
+        target_path = None
+        if isinstance(payload, etree._Element) and payload.getroottree().getroot() is copied_root:
+            # Record the structural position of the resolved target within the document, so that reference
+            # constraints can be matched against the actual node location (never the URI attribute text).
+            target_path = copied_root.getroottree().getpath(payload)
         payload_c14n = self._apply_transforms(
             payload,
             transforms_node=transforms,
@@ -668,7 +788,7 @@ class XMLVerifier(XMLSignatureProcessor):
             signature_key = signature_key_used
         else:
             signature_key = signature_key_used.public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo)
-        return VerifyResult(payload_c14n, payload_c14n_xml, signature, signature_key=signature_key)
+        return VerifyResult(payload_c14n, payload_c14n_xml, signature, signature_key=signature_key), target_path
 
     def validate_schema(self, signature):
         last_exception = None

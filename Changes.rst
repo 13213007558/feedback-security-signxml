@@ -1,3 +1,13 @@
+Unreleased
+==========
+
+-  Add ``ReferenceConstraint`` and the ``reference_constraints`` /
+   ``allow_extra_references`` settings in ``SignatureConfiguration`` to let
+   applications declare which business roles must be covered by verified
+   references and where each role's target is allowed to appear. When
+   configured, ``XMLVerifier.verify()`` returns a dict of results keyed by
+   role name.
+
 Changes for v5.2.0 (2026-10-18)
 ===============================
 
